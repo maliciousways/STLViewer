@@ -2657,6 +2657,16 @@
       geometry.applyMatrix4(initialTranslation);
       geometry.computeBoundingBox();
     }
+    // The model's own local bounding box, taken *after* the centering
+    // decision above — for a normal (non-preserved) model this is always
+    // symmetric (-size/2..size/2) since it was just re-centered on its own
+    // origin, but for a preserved model the geometry keeps whatever offset
+    // it was authored with. recomputeCombinedBounds() needs these real
+    // extents, not an assumed symmetric size, or a preserved model's world
+    // bounds (and therefore its camera framing) come out wrong whenever its
+    // local origin isn't at its own geometric center.
+    const localMin = bbox.min.clone();
+    const localMax = bbox.max.clone();
 
     const initialFinish = computeFinish();
     const material = new THREE.MeshPhongMaterial({
@@ -2695,6 +2705,7 @@
       triCount: parsed.positions.length / 9,
       vertCount: parsed.positions.length / 3,
       size,
+      localMin, localMax,
       opacity: 100,
       lastOpacity: 100,
       hasVertexColors,
@@ -2758,11 +2769,14 @@
     const min = new THREE.Vector3(Infinity, Infinity, Infinity);
     const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
     models.forEach((m) => {
-      const halfX = m.size.x / 2, halfY = m.size.y / 2, halfZ = m.size.z / 2;
+      // World-space bounds = group position + the model's own real local
+      // extents (not an assumed symmetric ±size/2 — see loadModelData's
+      // localMin/localMax comment for why that assumption breaks for a
+      // preserved model).
       const gx = m.group.position.x, gy = m.group.position.y, gz = m.group.position.z;
-      min.x = Math.min(min.x, gx - halfX); max.x = Math.max(max.x, gx + halfX);
-      min.y = Math.min(min.y, gy - halfY); max.y = Math.max(max.y, gy + halfY);
-      min.z = Math.min(min.z, gz - halfZ); max.z = Math.max(max.z, gz + halfZ);
+      min.x = Math.min(min.x, gx + m.localMin.x); max.x = Math.max(max.x, gx + m.localMax.x);
+      min.y = Math.min(min.y, gy + m.localMin.y); max.y = Math.max(max.y, gy + m.localMax.y);
+      min.z = Math.min(min.z, gz + m.localMin.z); max.z = Math.max(max.z, gz + m.localMax.z);
     });
     const size = new THREE.Vector3().subVectors(max, min);
     modelRadius = Math.max(size.x, size.y, size.z, 0.001) * 0.6;
@@ -3121,6 +3135,13 @@
     ownerModel.mesh.geometry.computeBoundingBox();
 
     ownerModel.size = size;
+    // Re-centered above, so this stays symmetric like a fresh (non-preserved)
+    // load — keep localMin/localMax in sync with `size` for
+    // recomputeCombinedBounds(). reorientToFace only ever runs on
+    // non-preserved models, so this never needs to run for a model whose
+    // bounds were captured as an intentional off-origin offset.
+    ownerModel.localMin = bbox.min.clone();
+    ownerModel.localMax = bbox.max.clone();
     // keep this model's X slot, just drop it back onto the shared floor
     ownerModel.group.position.y = size.y / 2;
 
