@@ -264,6 +264,14 @@
   }
   .model-vcolor-tag{
     color: var(--base);
+    cursor: pointer;
+    user-select: none;
+  }
+  .model-vcolor-tag:hover{
+    text-decoration: underline;
+  }
+  .model-vcolor-tag.off{
+    color: var(--ink-dim);
   }
   .model-export-row{
     display:flex; align-items:center; gap: 6px;
@@ -1424,7 +1432,10 @@
     modelColorMix = pct;
     const c = computeModelColor();
     models.forEach((m) => {
-      if(m.hasVertexColors || m.hasTexture) return; // keep the file's own colors untinted
+      // Keep the file's own colors untinted — but only while they're actually
+      // showing. With the color toggle off the model is back on the shared
+      // gray/beige material, so it should track this slider like any other.
+      if(hasFileColor(m) && m.colorOn) return;
       m.mesh.material.color.copy(c);
       m.mesh.material.needsUpdate = true;
     });
@@ -3043,6 +3054,10 @@
       lastOpacity: 100,
       hasVertexColors,
       hasTexture,
+      // Kept here as well as on the material, because the color toggle takes
+      // it off the material while color is off.
+      texture,
+      colorOn: true,   // only meaningful when hasFileColor(model)
       preserveAlignment: preserveThisModel,
       // Cumulative transform applied to the geometry since it was parsed
       // (centering, auto-orient, any later reorientation) — inverted later
@@ -3157,7 +3172,7 @@
     if(thkResult && thkResult.modelId === id) disposeThicknessResult();
 
     scene.remove(m.group);
-    if(m.mesh.material.map) m.mesh.material.map.dispose();
+    if(m.texture) m.texture.dispose(); // not m.mesh.material.map — the color toggle may have taken it off
     m.mesh.geometry.dispose(); m.mesh.material.dispose();
     m.wireMesh.geometry.dispose(); m.wireMesh.material.dispose();
     models.splice(idx, 1);
@@ -3242,6 +3257,33 @@
     renderModelList();
   }
 
+  // True when the file brought its own color: vertex colors or a texture map.
+  function hasFileColor(m){
+    return m.hasVertexColors || m.hasTexture;
+  }
+
+  // Shows or hides a model's file-provided color (vertex colors or texture).
+  // With it off the model drops back onto the shared gray/beige material, so
+  // it shades like every other model and follows the Gray/Beige slider.
+  function setModelColorOn(id, on){
+    const m = models.find(m => m.id === id);
+    if(!m || !hasFileColor(m)) return;
+    m.colorOn = on;
+    if(m.hasVertexColors) m.mesh.material.vertexColors = on;
+    if(m.hasTexture) m.mesh.material.map = on ? m.texture : null;
+    // Three.js multiplies the vertex colors and the texture by this base color,
+    // so it has to be white while they're showing and the mixed color once they're not.
+    m.mesh.material.color.copy(on ? new THREE.Color(0xffffff) : computeModelColor());
+    m.mesh.material.needsUpdate = true;
+  }
+
+  function toggleModelColor(id){
+    const m = models.find(m => m.id === id);
+    if(!m || !hasFileColor(m)) return;
+    setModelColorOn(id, !m.colorOn);
+    renderModelList();
+  }
+
   // ---------- Loaded-models list UI ----------
   function renderModelList(){
     refreshDevModelSelects();
@@ -3270,7 +3312,7 @@
           <span class="model-name" title="${escapeHtml(m.name)}">${escapeHtml(m.name)}</span>
           <button class="model-remove" data-id="${m.id}" title="Remove">×</button>
         </div>
-        <div class="model-meta">${m.format} · ${m.triCount.toLocaleString()} tris · ${m.size.x.toFixed(1)}×${m.size.z.toFixed(1)}×${m.size.y.toFixed(1)}${m.hasVertexColors ? ' · <span class="model-vcolor-tag">●&nbsp;vertex colors</span>' : ''}${m.hasTexture ? ' · <span class="model-vcolor-tag">●&nbsp;texture</span>' : ''}</div>
+        <div class="model-meta">${m.format} · ${m.triCount.toLocaleString()} tris · ${m.size.x.toFixed(1)}×${m.size.z.toFixed(1)}×${m.size.y.toFixed(1)}${hasFileColor(m) ? ` · <span class="model-vcolor-tag${m.colorOn ? '' : ' off'}" data-id="${m.id}" title="Toggle ${m.hasTexture ? 'texture' : 'vertex colors'}">●&nbsp;${m.hasTexture ? 'texture' : 'color'}</span>` : ''}</div>
         <div class="model-opacity-row">
           <span class="model-opacity-label model-opacity-toggle" data-id="${m.id}" title="Toggle opacity">Opacity</span>
           <input type="range" class="model-opacity-slider" data-id="${m.id}" min="0" max="100" value="${m.opacity}">
@@ -3296,6 +3338,9 @@
     });
     listEl.querySelectorAll('.model-opacity-toggle').forEach((label) => {
       label.addEventListener('click', () => toggleModelOpacity(Number(label.dataset.id)));
+    });
+    listEl.querySelectorAll('.model-vcolor-tag').forEach((tag) => {
+      tag.addEventListener('click', () => toggleModelColor(Number(tag.dataset.id)));
     });
     listEl.querySelectorAll('.model-remove').forEach((btn) => {
       btn.addEventListener('click', () => removeModel(Number(btn.dataset.id)));
