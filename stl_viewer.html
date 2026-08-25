@@ -1902,9 +1902,14 @@
   // there's no fixed reference "up" to suddenly snap when passing a pole,
   // because the up vector itself is just part of the same quaternion and
   // rotates smoothly along with the view.
+  // `target` and `orbitQuat` are `const` deliberately: viewA (below) aliases
+  // these exact objects, so they must only ever be mutated in place. `const`
+  // makes the language enforce that invariant instead of leaving it to
+  // convention — reassigning either would silently detach the alias and break
+  // single view in a way that is very hard to diagnose.
   const target = new THREE.Vector3(0, 0, 0);
   let radius = 12;
-  let orbitQuat = new THREE.Quaternion();
+  const orbitQuat = new THREE.Quaternion();
   let autoRotate = false;
 
   // ---------- View descriptors ----------
@@ -1913,12 +1918,16 @@
   // dual view.
   //
   // `viewA` is NOT a copy of the state above — it ALIASES it. `target` and
-  // `orbitQuat` are the very same objects (the existing code only ever mutates
-  // them in place, never reassigns them), and `radius` is an accessor pair
-  // onto the module-level `let radius` binding itself. So every generic helper
-  // below, when handed `viewA`, reads and writes exactly the same state the
-  // original inline code did — which is why single view cannot drift from the
-  // dual-view code path.
+  // `orbitQuat` are the very same objects, and both are declared `const` for
+  // exactly that reason: the whole scheme depends on them only ever being
+  // mutated in place (`.copy`, `.addScaledVector`, `.premultiply`), so the
+  // language, not a convention, is what stops a future edit from reassigning
+  // one and silently detaching the alias. `radius` is a primitive, so it is
+  // aliased instead by the accessor pair below, which reads and writes the
+  // module-level `let radius` binding itself. So every generic helper below,
+  // when handed `viewA`, reads and writes exactly the same state the original
+  // inline code did — which is why single view cannot drift from the dual-view
+  // code path.
   const viewA = {
     camera,
     target,
