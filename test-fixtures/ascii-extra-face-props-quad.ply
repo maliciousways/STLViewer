@@ -1,0 +1,22 @@
+ply
+format ascii 1.0
+comment synthetic fixture: the face element has a scalar property before
+comment vertex_indices and a second list property after it, as iTero scanners emit
+element vertex 4
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+element face 2
+property int object
+property list uchar int vertex_indices
+property list uchar float texcoord
+end_header
+0 0 0 255 0 0
+1 0 0 0 255 0
+1 1 0 0 0 255
+0 1 0 255 255 0
+0 3 0 1 2 6 0 0 1 0 1 1
+0 3 0 2 3 6 0 0 1 1 0 1

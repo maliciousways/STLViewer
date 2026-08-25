@@ -2301,6 +2301,17 @@
     return PLY_INT_TYPES.has(type) ? v / 255 : v;
   }
 
+  // A face element may legally carry several list properties — `vertex_indices` alongside a
+  // per-corner `texcoord` list is common in scanner output. Pick the connectivity list by name
+  // rather than taking whichever list happens to come first, and only fall back to "first list"
+  // for files that use some nonstandard name.
+  const PLY_INDEX_PROPERTY_NAMES = new Set(['vertex_indices','vertex_index','vertex_indexes']);
+  function findPlyIndexProperty(element){
+    let idx = element.properties.findIndex(p => p.list && PLY_INDEX_PROPERTY_NAMES.has(p.name));
+    if(idx === -1) idx = element.properties.findIndex(p => p.list);
+    return idx;
+  }
+
   function findBytesSequence(bytes, needle, fromIndex){
     const n = needle.length;
     outer:
@@ -2377,31 +2388,56 @@
         while(lineIdx < dataLines.length && dataLines[lineIdx].trim() === '') lineIdx++;
         return dataLines[lineIdx++] || '';
       }
-      for(let i = 0; i < vertexCount; i++){
+      // One record per line, but a property is not necessarily one token: a list property
+      // is a count followed by that many values. Walk the properties with a token cursor
+      // so a scalar or a list declared before the one we want doesn't shift everything.
+      function readRecord(properties){
         const tokens = nextLine().trim().split(/\s+/).map(Number);
-        vertices[i*3] = tokens[xIdx]; vertices[i*3+1] = tokens[yIdx]; vertices[i*3+2] = tokens[zIdx];
-        if(hasColor){
-          vertColors[i*3]   = normalizePlyColor(tokens[rIdx], rType);
-          vertColors[i*3+1] = normalizePlyColor(tokens[gIdx], gType);
-          vertColors[i*3+2] = normalizePlyColor(tokens[bIdx], bType);
+        const values = new Array(properties.length);
+        let t = 0;
+        for(let p = 0; p < properties.length; p++){
+          const prop = properties[p];
+          if(prop.list){
+            const n = tokens[t++];
+            values[p] = tokens.slice(t, t + n);
+            t += n;
+          } else {
+            values[p] = tokens[t++];
+          }
         }
+        return values;
       }
-      if(faceElement){
-        for(let i = 0; i < faceElement.count; i++){
-          const tokens = nextLine().trim().split(/\s+/).map(Number);
-          const n = tokens[0];
-          const idxs = tokens.slice(1, 1 + n);
-          for(let k = 1; k < n - 1; k++){
-            const a = idxs[0], b = idxs[k], c = idxs[k+1];
-            positions.push(vertices[a*3], vertices[a*3+1], vertices[a*3+2]);
-            positions.push(vertices[b*3], vertices[b*3+1], vertices[b*3+2]);
-            positions.push(vertices[c*3], vertices[c*3+1], vertices[c*3+2]);
+      for(const element of elements){
+        if(element === vertexElement){
+          for(let i = 0; i < vertexCount; i++){
+            const values = readRecord(element.properties);
+            vertices[i*3] = values[xIdx]; vertices[i*3+1] = values[yIdx]; vertices[i*3+2] = values[zIdx];
             if(hasColor){
-              colorsOut.push(vertColors[a*3], vertColors[a*3+1], vertColors[a*3+2]);
-              colorsOut.push(vertColors[b*3], vertColors[b*3+1], vertColors[b*3+2]);
-              colorsOut.push(vertColors[c*3], vertColors[c*3+1], vertColors[c*3+2]);
+              vertColors[i*3]   = normalizePlyColor(values[rIdx], rType);
+              vertColors[i*3+1] = normalizePlyColor(values[gIdx], gType);
+              vertColors[i*3+2] = normalizePlyColor(values[bIdx], bType);
             }
           }
+        } else if(element === faceElement){
+          const indexPropIdx = findPlyIndexProperty(element);
+          for(let i = 0; i < element.count; i++){
+            const idxs = readRecord(element.properties)[indexPropIdx];
+            if(!idxs) continue;
+            for(let k = 1; k < idxs.length - 1; k++){
+              const a = idxs[0], b = idxs[k], c = idxs[k+1];
+              if(a < 0 || b < 0 || c < 0 || a >= vertexCount || b >= vertexCount || c >= vertexCount) continue;
+              positions.push(vertices[a*3], vertices[a*3+1], vertices[a*3+2]);
+              positions.push(vertices[b*3], vertices[b*3+1], vertices[b*3+2]);
+              positions.push(vertices[c*3], vertices[c*3+1], vertices[c*3+2]);
+              if(hasColor){
+                colorsOut.push(vertColors[a*3], vertColors[a*3+1], vertColors[a*3+2]);
+                colorsOut.push(vertColors[b*3], vertColors[b*3+1], vertColors[b*3+2]);
+                colorsOut.push(vertColors[c*3], vertColors[c*3+1], vertColors[c*3+2]);
+              }
+            }
+          }
+        } else {
+          for(let i = 0; i < element.count; i++) nextLine();
         }
       }
       return {
@@ -2429,36 +2465,64 @@
         offset += PLY_TYPE_SIZE[type];
         return v;
       }
-      for(let i = 0; i < vertexCount; i++){
-        let x = 0, y = 0, z = 0, r = 0, g = 0, b = 0;
-        vertexElement.properties.forEach((prop, pIdx) => {
-          const v = readScalar(prop.type);
-          if(pIdx === xIdx) x = v;
-          else if(pIdx === yIdx) y = v;
-          else if(pIdx === zIdx) z = v;
-          else if(hasColor && pIdx === rIdx) r = normalizePlyColor(v, rType);
-          else if(hasColor && pIdx === gIdx) g = normalizePlyColor(v, gType);
-          else if(hasColor && pIdx === bIdx) b = normalizePlyColor(v, bType);
-        });
-        vertices[i*3] = x; vertices[i*3+1] = y; vertices[i*3+2] = z;
-        if(hasColor){ vertColors[i*3] = r; vertColors[i*3+1] = g; vertColors[i*3+2] = b; }
+      // Reads ONE property of one record: a number for a scalar, an array for a list.
+      // A binary PLY record has no delimiter or length prefix — its extent is defined
+      // solely by the properties the header declares for it. So every property must be
+      // read even when its value is discarded, or the cursor desynchronises for the
+      // whole rest of the file.
+      function readProperty(prop){
+        if(!prop.list) return readScalar(prop.type);
+        const n = readScalar(prop.countType);
+        const out = new Array(n);
+        for(let k = 0; k < n; k++) out[k] = readScalar(prop.indexType);
+        return out;
       }
-      if(faceElement){
-        const listProp = faceElement.properties.find(p => p.list);
-        for(let i = 0; i < faceElement.count; i++){
-          const n = readScalar(listProp.countType);
-          const idxs = [];
-          for(let k = 0; k < n; k++) idxs.push(readScalar(listProp.indexType));
-          for(let k = 1; k < n - 1; k++){
-            const a = idxs[0], b2 = idxs[k], c = idxs[k+1];
-            positions.push(vertices[a*3], vertices[a*3+1], vertices[a*3+2]);
-            positions.push(vertices[b2*3], vertices[b2*3+1], vertices[b2*3+2]);
-            positions.push(vertices[c*3], vertices[c*3+1], vertices[c*3+2]);
-            if(hasColor){
-              colorsOut.push(vertColors[a*3], vertColors[a*3+1], vertColors[a*3+2]);
-              colorsOut.push(vertColors[b2*3], vertColors[b2*3+1], vertColors[b2*3+2]);
-              colorsOut.push(vertColors[c*3], vertColors[c*3+1], vertColors[c*3+2]);
+      // Walk the elements in header order. Anything that isn't vertex or face still has
+      // to be stepped over rather than ignored, for the same reason.
+      for(const element of elements){
+        if(element === vertexElement){
+          for(let i = 0; i < vertexCount; i++){
+            let x = 0, y = 0, z = 0, r = 0, g = 0, b = 0;
+            for(let pIdx = 0; pIdx < element.properties.length; pIdx++){
+              const v = readProperty(element.properties[pIdx]);
+              if(pIdx === xIdx) x = v;
+              else if(pIdx === yIdx) y = v;
+              else if(pIdx === zIdx) z = v;
+              else if(hasColor && pIdx === rIdx) r = normalizePlyColor(v, rType);
+              else if(hasColor && pIdx === gIdx) g = normalizePlyColor(v, gType);
+              else if(hasColor && pIdx === bIdx) b = normalizePlyColor(v, bType);
             }
+            vertices[i*3] = x; vertices[i*3+1] = y; vertices[i*3+2] = z;
+            if(hasColor){ vertColors[i*3] = r; vertColors[i*3+1] = g; vertColors[i*3+2] = b; }
+          }
+        } else if(element === faceElement){
+          const indexPropIdx = findPlyIndexProperty(element);
+          for(let i = 0; i < element.count; i++){
+            let idxs = null;
+            for(let pIdx = 0; pIdx < element.properties.length; pIdx++){
+              const v = readProperty(element.properties[pIdx]);
+              if(pIdx === indexPropIdx) idxs = v;
+            }
+            if(!idxs) continue;
+            for(let k = 1; k < idxs.length - 1; k++){
+              const a = idxs[0], b2 = idxs[k], c = idxs[k+1];
+              // Same guard parseOBJ() applies: one out-of-range index would put an
+              // undefined (→ NaN) into the position buffer, and a single NaN vertex
+              // makes the whole bounding box NaN, wrecking auto-framing and clipping.
+              if(a < 0 || b2 < 0 || c < 0 || a >= vertexCount || b2 >= vertexCount || c >= vertexCount) continue;
+              positions.push(vertices[a*3], vertices[a*3+1], vertices[a*3+2]);
+              positions.push(vertices[b2*3], vertices[b2*3+1], vertices[b2*3+2]);
+              positions.push(vertices[c*3], vertices[c*3+1], vertices[c*3+2]);
+              if(hasColor){
+                colorsOut.push(vertColors[a*3], vertColors[a*3+1], vertColors[a*3+2]);
+                colorsOut.push(vertColors[b2*3], vertColors[b2*3+1], vertColors[b2*3+2]);
+                colorsOut.push(vertColors[c*3], vertColors[c*3+1], vertColors[c*3+2]);
+              }
+            }
+          }
+        } else {
+          for(let i = 0; i < element.count; i++){
+            for(const prop of element.properties) readProperty(prop);
           }
         }
       }
