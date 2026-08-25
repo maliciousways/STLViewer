@@ -2949,7 +2949,9 @@
   function escapeHtml(str){
     const div = document.createElement('div');
     div.textContent = str;
-    return div.innerHTML;
+    // innerHTML already escapes & < > for text content; also escape the
+    // quote characters so the result is safe inside a "..."/'...' attribute.
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   // ================= REORIENT: PICK FLAT BASE =================
