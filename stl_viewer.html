@@ -524,6 +524,22 @@
     transition: left .15s ease, background .15s ease;
   }
   .switch.on::after{ left: 17px; background: var(--accent); }
+  /* A switch that can't be used right now (e.g. dual view with only one model
+     loaded) — dimmed and click-inert, matching how disabled buttons read. */
+  .switch.disabled{
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  /* Sections whose tools are unavailable while dual view is on: dimmed, and
+     click-inert so nothing inside can be operated. One class covers buttons,
+     switches, sliders and selects alike, and removing it restores every
+     control exactly as it was. The section header stays clickable so the
+     section can still be collapsed. */
+  .section.dual-locked > .section-body{
+    opacity: 0.4;
+    pointer-events: none;
+  }
 
   button.action{
     width:100%;
@@ -583,7 +599,7 @@
     border-color: var(--panel-line);
   }
 
-  #sectionHint, #baseHint, #threePointHint, #marginHint, #measure3DHint, #undercutHint, #devHint, #thkHint{
+  #sectionHint, #baseHint, #threePointHint, #marginHint, #measure3DHint, #undercutHint, #devHint, #thkHint, #dualHint{
     font-size: 11.5px;
     color: var(--ink-dim);
     line-height: 1.5;
@@ -627,6 +643,45 @@
   #canvasHolder canvas.crosshair{ cursor: crosshair; }
   #canvasHolder canvas.move-plane{ cursor: move; }
   #canvasHolder canvas.point-hover{ cursor: pointer; }
+
+  /* ---------- Dual view pane chrome ----------
+     Purely decorative overlays drawn on top of the single canvas that the two
+     scissored viewports share — they never intercept pointer events, so an
+     orbit drag that starts on a pane label still reaches the canvas. */
+  #dualDivider{
+    position:absolute;
+    top:0; bottom:0; left:50%;
+    width:1px;
+    background: var(--panel-line);
+    pointer-events:none;
+    z-index: 4;
+    display:none;
+  }
+  .dual-pane{
+    position:absolute;
+    top:0; bottom:0;
+    width:50%;
+    pointer-events:none;
+    z-index: 4;
+    display:none;
+    border: 1px solid transparent;
+  }
+  .dual-pane.active{ border-color: var(--accent-dim); }
+  #dualPaneL{ left:0; }
+  #dualPaneR{ left:50%; }
+  .dual-pane-label{
+    position:absolute;
+    /* Sits below #corner-tl / #corner-tr so it never collides with them. */
+    top: 34px; left: 14px; right: 14px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: var(--ink-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dual-pane.active .dual-pane-label{ color: var(--accent); }
 
   #drawOverlay{
     position:absolute; inset:0;
@@ -931,6 +986,33 @@
       </div>
     </div>
 
+    <div class="section" id="secDualView">
+      <div class="section-label section-toggle"><span>Dual View</span><span class="section-chevron">▸</span></div>
+      <div class="section-body">
+        <div class="toggle-row">
+          <label for="tDualView">Dual view</label>
+          <div class="switch disabled" id="tDualView"></div>
+        </div>
+        <div class="side-select-row">
+          <label for="dualLeftSelect">Left pane</label>
+          <select class="side-select" id="dualLeftSelect" disabled></select>
+        </div>
+        <div class="side-select-row">
+          <label for="dualRightSelect">Right pane</label>
+          <select class="side-select" id="dualRightSelect" disabled></select>
+        </div>
+        <div id="dualControls" style="display:none;">
+          <div class="toggle-row" style="padding-top:8px;">
+            <label for="tDualLock">🔒 Lock views</label>
+            <div class="switch" id="tDualLock"></div>
+          </div>
+          <button class="action" id="btnDualReset">Reset both views</button>
+        </div>
+        <div id="dualHint">Shows two loaded scans <b>side by side</b>, each with its own camera. With <b>Lock views</b> on, orbiting, panning and zooming either pane drives both. <b>Reset both views</b> returns each pane to its own scan's original framing, which also puts the two panes back in sync.</div>
+        <div id="dualDisabledNote" style="font-size:11.5px; color:var(--ink-dim); line-height:1.5; margin-top:6px;"></div>
+      </div>
+    </div>
+
     <div class="section" id="secDisplay">
       <div class="section-label section-toggle"><span>Display</span><span class="section-chevron">▸</span></div>
       <div class="section-body">
@@ -1148,6 +1230,9 @@
   <div id="viewport">
 
     <div id="canvasHolder"></div>
+    <div id="dualDivider"></div>
+    <div class="dual-pane" id="dualPaneL"><div class="dual-pane-label" id="dualLabelL"></div></div>
+    <div class="dual-pane" id="dualPaneR"><div class="dual-pane-label" id="dualLabelR"></div></div>
     <svg id="drawOverlay"></svg>
     <div id="drawBanner"></div>
 
@@ -1817,10 +1902,118 @@
   // there's no fixed reference "up" to suddenly snap when passing a pole,
   // because the up vector itself is just part of the same quaternion and
   // rotates smoothly along with the view.
+  // `target` and `orbitQuat` are `const` deliberately: viewA (below) aliases
+  // these exact objects, so they must only ever be mutated in place. `const`
+  // makes the language enforce that invariant instead of leaving it to
+  // convention — reassigning either would silently detach the alias and break
+  // single view in a way that is very hard to diagnose.
   const target = new THREE.Vector3(0, 0, 0);
   let radius = 12;
-  let orbitQuat = new THREE.Quaternion();
+  const orbitQuat = new THREE.Quaternion();
   let autoRotate = false;
+
+  // ---------- View descriptors ----------
+  // A "view" bundles everything that defines one camera's framing, so the
+  // orbit/pan/zoom math can be written once and pointed at either pane in
+  // dual view.
+  //
+  // `viewA` is NOT a copy of the state above — it ALIASES it. `target` and
+  // `orbitQuat` are the very same objects, and both are declared `const` for
+  // exactly that reason: the whole scheme depends on them only ever being
+  // mutated in place (`.copy`, `.addScaledVector`, `.premultiply`), so the
+  // language, not a convention, is what stops a future edit from reassigning
+  // one and silently detaching the alias. `radius` is a primitive, so it is
+  // aliased instead by the accessor pair below, which reads and writes the
+  // module-level `let radius` binding itself. So every generic helper below,
+  // when handed `viewA`, reads and writes exactly the same state the original
+  // inline code did — which is why single view cannot drift from the dual-view
+  // code path.
+  const viewA = {
+    camera,
+    target,
+    orbitQuat,
+    get radius(){ return radius; },
+    set radius(v){ radius = v; },
+    // Framing this pane returns to on reset, plus the model radius that
+    // framing was derived from. Written and read by dual view only.
+    home: { target: new THREE.Vector3(), radius: 12, quat: new THREE.Quaternion() },
+    homeModelRadius: 0,
+    modelId: null
+  };
+  let viewB = null; // second pane's view — built lazily on first dual-view entry
+
+  // ---------- Dual view state ----------
+  // Declared up here (rather than beside the DUAL VIEW functions further down)
+  // because resize(), animate() and the pointer handlers consult `dualActive`
+  // from the moment the script initialises.
+  let dualActive = false;
+  let dualLocked = false;
+  let dualActivePane = 0;   // 0 = left pane, 1 = right pane
+  let dualLeftId = null;
+  let dualRightId = null;
+  let dualSavedSceneVis = null;   // [{ obj, visible }] snapshot of scene-level tool visuals
+  let dualCsPanelWasOpen = false;
+
+  // Both collapse to the single existing view whenever dual view is off, so
+  // every caller keeps its current behaviour unchanged.
+  function allViews(){
+    return (dualActive && viewB) ? [viewA, viewB] : [viewA];
+  }
+  function activeView(){
+    return (dualActive && viewB && dualActivePane === 1) ? viewB : viewA;
+  }
+  function paneView(index){
+    return index === 1 ? viewB : viewA;
+  }
+
+  // Zoom limits scale with whatever that view is actually looking at: outside
+  // dual view that's the combined bounds of every loaded model (exactly as
+  // before), inside dual view it's the pane's own scan.
+  function viewModelRadius(v){
+    return (dualActive && v.homeModelRadius) ? v.homeModelRadius : modelRadius;
+  }
+
+  function applyView(v){
+    const dir = new THREE.Vector3(0, 0, 1).applyQuaternion(v.orbitQuat);
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(v.orbitQuat);
+    v.camera.position.copy(v.target).addScaledVector(dir, v.radius);
+    v.camera.up.copy(up);
+    v.camera.lookAt(v.target);
+    updateLightsToCamera(v);
+  }
+
+  // Applies a drag as two incremental rotations around the camera's OWN
+  // current right/up axes (not fixed world axes) — this is what keeps
+  // dragging feeling consistent even upside-down, with no lock.
+  function orbitView(v, dx, dy){
+    const speed = 0.007;
+    const localRight = new THREE.Vector3(1, 0, 0).applyQuaternion(v.orbitQuat);
+    const localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(v.orbitQuat);
+    const qYaw = new THREE.Quaternion().setFromAxisAngle(localUp, -dx * speed);
+    const qPitch = new THREE.Quaternion().setFromAxisAngle(localRight, -dy * speed);
+    v.orbitQuat.premultiply(qYaw).premultiply(qPitch).normalize();
+  }
+
+  function panView(v, dx, dy){
+    const panSpeed = v.radius * 0.0007;
+    const camDir = new THREE.Vector3();
+    v.camera.getWorldDirection(camDir);
+    const rightVec = new THREE.Vector3().crossVectors(camDir, v.camera.up).normalize();
+    const upReal = new THREE.Vector3().crossVectors(rightVec, camDir).normalize();
+    v.target.addScaledVector(rightVec, -dx * panSpeed);
+    v.target.addScaledVector(upReal, dy * panSpeed);
+  }
+
+  function zoomView(v, factor){
+    const mr = viewModelRadius(v);
+    v.radius = Math.max(mr * 0.05, Math.min(mr * 30, v.radius / factor));
+  }
+
+  // Called after any interactive change to `src` so a locked partner pane
+  // follows it. No-op unless dual view is on AND lock is set.
+  function nudgeLockedPartner(src){
+    if(dualActive && dualLocked) syncLockedViews(src);
+  }
 
   // Builds a camera-orientation quaternion that looks along `dir` with
   // "up" kept as close to world-up as possible (the standard orbit-camera
@@ -1875,21 +2068,23 @@
   function snapToView(viewName){
     const dir = HEX_VIEW_DIRECTIONS[viewName];
     if(!dir) return;
-    orbitQuat.copy(buildLookQuaternion(dir));
-    updateCamera(); // keeps the current radius/target — only the angle snaps
+    // In dual view this snaps the pane the user last interacted with (and
+    // carries the other one along if the views are locked); outside dual view
+    // activeView() is always viewA, i.e. the single camera.
+    const v = activeView();
+    v.orbitQuat.copy(buildLookQuaternion(dir));
+    applyView(v); // keeps the current radius/target — only the angle snaps
+    nudgeLockedPartner(v);
   }
 
   document.querySelectorAll('#viewHex .hex-wedge').forEach((wedge) => {
     wedge.addEventListener('click', () => snapToView(wedge.dataset.view));
   });
 
+  // Kept as-is for its ~15 existing call sites — viewA aliases the same
+  // target/radius/orbitQuat/camera this used to touch inline.
   function updateCamera(){
-    const dir = new THREE.Vector3(0, 0, 1).applyQuaternion(orbitQuat);
-    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(orbitQuat);
-    camera.position.copy(target).addScaledVector(dir, radius);
-    camera.up.copy(up);
-    camera.lookAt(target);
-    updateLightsToCamera();
+    applyView(viewA);
   }
   updateCamera();
 
@@ -1898,39 +2093,32 @@
   // the fill/rim lights sit just off to the sides for some dimensionality.
   // Since this runs every time updateCamera does, rotating, zooming, or
   // panning all carry the lighting along with the view automatically.
-  function updateLightsToCamera(){
+  // `v` defaults to viewA, so calls with no argument behave exactly as before.
+  // Dual view re-runs this per pane just before that pane's render pass, so
+  // the shared light rig is aimed at whichever camera is about to draw.
+  function updateLightsToCamera(v){
+    const view = v || viewA;
+    const cam = view.camera, tgt = view.target, rad = view.radius;
     const camDir = new THREE.Vector3();
-    camera.getWorldDirection(camDir);
-    const right = new THREE.Vector3().crossVectors(camDir, camera.up).normalize();
-    const up = camera.up;
+    cam.getWorldDirection(camDir);
+    const right = new THREE.Vector3().crossVectors(camDir, cam.up).normalize();
+    const up = cam.up;
 
-    key.position.copy(camera.position);
-    key.target.position.copy(target);
+    key.position.copy(cam.position);
+    key.target.position.copy(tgt);
     key.target.updateMatrixWorld();
 
-    fill.position.copy(camera.position)
-      .addScaledVector(right, -radius * 0.35)
-      .addScaledVector(up, radius * 0.2);
-    fill.target.position.copy(target);
+    fill.position.copy(cam.position)
+      .addScaledVector(right, -rad * 0.35)
+      .addScaledVector(up, rad * 0.2);
+    fill.target.position.copy(tgt);
     fill.target.updateMatrixWorld();
 
-    rim.position.copy(camera.position)
-      .addScaledVector(right, radius * 0.4)
-      .addScaledVector(up, -radius * 0.15);
-    rim.target.position.copy(target);
+    rim.position.copy(cam.position)
+      .addScaledVector(right, rad * 0.4)
+      .addScaledVector(up, -rad * 0.15);
+    rim.target.position.copy(tgt);
     rim.target.updateMatrixWorld();
-  }
-
-  // Applies a drag as two incremental rotations around the camera's OWN
-  // current right/up axes (not fixed world axes) — this is what keeps
-  // dragging feeling consistent even upside-down, with no lock.
-  function orbitDrag(dx, dy){
-    const speed = 0.007;
-    const localRight = new THREE.Vector3(1, 0, 0).applyQuaternion(orbitQuat);
-    const localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(orbitQuat);
-    const qYaw = new THREE.Quaternion().setFromAxisAngle(localUp, -dx * speed);
-    const qPitch = new THREE.Quaternion().setFromAxisAngle(localRight, -dy * speed);
-    orbitQuat.premultiply(qYaw).premultiply(qPitch).normalize();
   }
 
   let dragging = false;
@@ -1948,12 +2136,25 @@
     const rect = canvas.getBoundingClientRect();
     return { x: clientX - rect.left, y: clientY - rect.top };
   }
+  // Which half of the canvas a pointer event landed in. Only meaningful while
+  // dual view is on.
+  function paneIndexForClientX(clientX){
+    const rect = canvas.getBoundingClientRect();
+    return (clientX - rect.left) < rect.width / 2 ? 0 : 1;
+  }
 
   canvas.addEventListener('contextmenu', e => e.preventDefault());
 
   canvas.addEventListener('mousedown', (e) => {
     if(e.button === 1) e.preventDefault(); // stop the browser's native middle-click autoscroll
     const isPrimaryClick = e.button === 0;
+
+    // Dual view: whichever half you press in becomes the pane that subsequent
+    // drags, the wheel, the hex snapper and "Reset view" act on. Every tool
+    // branch below is unreachable in dual view (they're all disarmed and their
+    // controls disabled on entry), so the handler falls straight through to
+    // the orbit/pan case.
+    if(dualActive) setDualActivePane(paneIndexForClientX(e.clientX));
 
     // 0) The undercut axis gizmo owns this click if the pointer is over one
     // of its rotation rings. `axis` is set by TransformControls' own
@@ -2067,31 +2268,34 @@
     const dy = e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
 
+    const v = activeView(); // always viewA outside dual view
     if(panning){
-      const panSpeed = radius * 0.0007;
-      const camDir = new THREE.Vector3();
-      camera.getWorldDirection(camDir);
-      const rightVec = new THREE.Vector3().crossVectors(camDir, camera.up).normalize();
-      const upReal = new THREE.Vector3().crossVectors(rightVec, camDir).normalize();
-      target.addScaledVector(rightVec, -dx * panSpeed);
-      target.addScaledVector(upReal, dy * panSpeed);
+      panView(v, dx, dy);
     } else {
-      orbitDrag(dx, dy);
+      orbitView(v, dx, dy);
     }
-    updateCamera();
+    applyView(v);
+    nudgeLockedPartner(v);
   });
 
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
+    if(dualActive) setDualActivePane(paneIndexForClientX(e.clientX));
     const factor = Math.pow(0.999, -e.deltaY * (e.deltaMode === 1 ? 18 : 1));
-    radius = Math.max(modelRadius * 0.05, Math.min(modelRadius * 30, radius / factor));
-    updateCamera();
+    const v = activeView();
+    zoomView(v, factor);
+    applyView(v);
+    nudgeLockedPartner(v);
     if(cutPlane && typeof updateCrossSectionView === 'function'){
       updateCrossSectionView(lastCsSegArray); // keep the 2D view's zoom in sync with the 3D camera
     }
   }, { passive: false });
 
   window.addEventListener('keydown', (e) => {
+    // Every tool these shortcuts drive is unavailable in dual view, so their
+    // shortcuts are too — otherwise Ctrl+Z could still mutate margin state
+    // that the user can't see.
+    if(dualActive) return;
     if(e.key === 'Escape'){
       if(sectionArmed){ setSectionArmed(false); isDrawingSection = false; hideDrawOverlay(); }
       if(baseArmed){ setBaseArmed(false); }
@@ -2124,6 +2328,7 @@
   let touchMode = null;
   let touchStartDist = 0;
   canvas.addEventListener('touchstart', (e) => {
+    if(dualActive && e.touches.length) setDualActivePane(paneIndexForClientX(e.touches[0].clientX));
     if(e.touches.length === 1){
       touchMode = 'orbit';
       lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
@@ -2137,14 +2342,18 @@
       const dx = e.touches[0].clientX - lastX;
       const dy = e.touches[0].clientY - lastY;
       lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
-      orbitDrag(dx, dy);
-      updateCamera();
+      const v = activeView();
+      orbitView(v, dx, dy);
+      applyView(v);
+      nudgeLockedPartner(v);
     } else if(touchMode === 'pinch' && e.touches.length === 2){
       const d = dist(e.touches[0], e.touches[1]);
       const factor = d / touchStartDist;
       touchStartDist = d;
-      radius = Math.max(modelRadius * 0.05, Math.min(modelRadius * 30, radius / factor));
-      updateCamera();
+      const v = activeView();
+      zoomView(v, factor);
+      applyView(v);
+      nudgeLockedPartner(v);
       if(cutPlane && typeof updateCrossSectionView === 'function'){
         updateCrossSectionView(lastCsSegArray);
       }
@@ -2161,8 +2370,14 @@
     const w = holder.clientWidth, h = holder.clientHeight;
     if(w === lastResizeW && h === lastResizeH) return; // cheap to call every frame
     lastResizeW = w; lastResizeH = h;
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
+    // In dual view each camera only owns half the canvas width, so its aspect
+    // comes from the half-pane. With dual view off allViews() is [viewA] and
+    // camW is w — identical to the original single line.
+    const camW = dualActive ? w / 2 : w;
+    allViews().forEach((v) => {
+      v.camera.aspect = camW / h;
+      v.camera.updateProjectionMatrix();
+    });
     renderer.setSize(w, h);
     css2dRenderer.setSize(w, h);
     const overlay = document.getElementById('drawOverlay');
@@ -2171,6 +2386,13 @@
     overlay.setAttribute('viewBox', `0 0 ${w} ${h}`);
   }
   window.addEventListener('resize', resize);
+  // Entering/leaving dual view doesn't change the canvas size, but it does
+  // change every camera's aspect — so the cached-size early-out above has to
+  // be defeated explicitly.
+  function invalidateResize(){
+    lastResizeW = -1; lastResizeH = -1;
+    resize();
+  }
   resize();
 
   // ---------- Axis indicator ----------
@@ -2182,8 +2404,11 @@
       { v: new THREE.Vector3(0,1,0), color: '#6bffa0', label: 'Y' },
       { v: new THREE.Vector3(0,0,1), color: '#6bb8ff', label: 'Z' },
     ];
-    const camDir = new THREE.Vector3(0, 0, 1).applyQuaternion(orbitQuat).normalize();
-    const up = camera.up.clone();
+    // In dual view this reflects the active pane; outside it, activeView() is
+    // viewA, whose orbitQuat/camera are the originals.
+    const indicatorView = activeView();
+    const camDir = new THREE.Vector3(0, 0, 1).applyQuaternion(indicatorView.orbitQuat).normalize();
+    const up = indicatorView.camera.up.clone();
     let right = new THREE.Vector3().crossVectors(up, camDir);
     if(right.lengthSq() < 1e-6) right.set(1,0,0);
     right.normalize();
@@ -2854,6 +3079,10 @@
 
   function frameCameraOnModels(){
     const { min, max } = recomputeCombinedBounds();
+    // In dual view each pane frames its own scan, so loading another file
+    // must not yank the panes onto the combined bounds. The grid/modelRadius
+    // update above still runs.
+    if(dualActive) return;
     const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
     target.copy(center);
     // Framing distance scales with FOV (via tan(fov/2)) so the model reads
@@ -2971,6 +3200,12 @@
   function renderModelList(){
     refreshDevModelSelects();
     refreshThkModelSelect();
+    // The dual-view pane pickers are driven off the same model list, and this
+    // is the one function every add/remove path already goes through. Done
+    // before the empty-list early-out below so removing the last models still
+    // tears an active dual view down.
+    refreshDualSelects();
+    reconcileDualPanes();
     const listEl = document.getElementById('modelList');
     const summaryEl = document.getElementById('modelSummary');
     if(models.length === 0){
@@ -4889,7 +5124,11 @@
   // by the renderer regardless of an object's own transform, so the same
   // plane array works for every model without adjustment.
   function updateClipping(){
-    const planes = (clipEnabled && cutPlane) ? [getClipPlane()] : [];
+    // Dual view suspends the clip: the cut plane belongs to the single-view
+    // section tool and each pane shows a different model. `clipEnabled` and
+    // `cutPlane` are deliberately left untouched, so calling this again on the
+    // way out restores the clip exactly as it was.
+    const planes = (!dualActive && clipEnabled && cutPlane) ? [getClipPlane()] : [];
     models.forEach((m) => {
       m.mesh.material.clippingPlanes = planes; m.mesh.material.needsUpdate = true;
       m.wireMesh.material.clippingPlanes = planes; m.wireMesh.material.needsUpdate = true;
@@ -5301,6 +5540,353 @@
 
   // ================= /TOOLS =================
 
+  // ================= DUAL VIEW =================
+  // Two scans side by side, each with its own camera, in the ONE existing
+  // canvas — drawn as two scissored viewports of the single WebGLRenderer
+  // rather than as a second renderer. That keeps every pointer/wheel/touch
+  // listener, every cursor class, the TransformControls binding and the resize
+  // path pointed at the one canvas they already know about; a second canvas
+  // would mean duplicating or re-dispatching all of it.
+  //
+  // Which model appears in which pane is handled by flipping group.visible
+  // around each render pass and restoring it inside the same frame, so no
+  // per-object state survives a frame and there is nothing to unwind on exit.
+  // It also gets the analysis overlays right for free — the undercut,
+  // deviation and thickness overlay meshes are children of model.group, so
+  // they travel with their model into the correct pane.
+
+  const DUAL_LOCKED_SECTION_IDS = [
+    'secSectionCut', 'secReorient', 'secPrepMargin', 'secMeasure', 'secUndercut', 'secMapping'
+  ];
+
+  function ensureViewB(){
+    if(viewB) return viewB;
+    const cam = new THREE.PerspectiveCamera(camera.fov, camera.aspect, camera.near, camera.far);
+    viewB = {
+      camera: cam,
+      target: new THREE.Vector3(),
+      orbitQuat: new THREE.Quaternion(),
+      radius: 12,
+      home: { target: new THREE.Vector3(), radius: 12, quat: new THREE.Quaternion() },
+      homeModelRadius: 0,
+      modelId: null
+    };
+    return viewB;
+  }
+
+  // "The original coordinates of each scan": the framing this app would give a
+  // model if it were the only one loaded. Same math as frameCameraOnModels(),
+  // restricted to one model's own world-space bounds — so it reflects exactly
+  // where and how that scan sits, including any re-basing the user has done
+  // since, rather than a snapshot that could go stale.
+  function computeModelFraming(model){
+    const box = new THREE.Box3().setFromObject(model.group);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    if(box.isEmpty()){
+      // Degenerate/empty geometry — fall back to the model's recorded size
+      // and group position so nothing downstream sees Infinity/NaN.
+      size.copy(model.size);
+      center.copy(model.group.position);
+    } else {
+      box.getSize(size);
+      box.getCenter(center);
+    }
+    const mr = Math.max(size.x, size.y, size.z, 0.001) * 0.6;
+    const FRAMING_K = 1.3255; // same constant frameCameraOnModels() uses
+    return {
+      target: center,
+      radius: (mr * FRAMING_K) / Math.tan((camera.fov * Math.PI / 180) / 2),
+      quat: buildLookQuaternion(HEX_VIEW_DIRECTIONS.bottom),
+      modelRadius: mr
+    };
+  }
+
+  // Recomputes the pane's home framing from its current model and snaps the
+  // live view onto it. Both panes reset => both are at zero offset from their
+  // own home => they are back in sync with one another by construction.
+  function resetPaneView(paneIndex){
+    const v = paneView(paneIndex);
+    if(!v) return;
+    const model = models.find(m => m.id === v.modelId);
+    if(model){
+      const f = computeModelFraming(model);
+      v.home.target.copy(f.target);
+      v.home.radius = f.radius;
+      v.home.quat.copy(f.quat);
+      v.homeModelRadius = f.modelRadius;
+    }
+    v.target.copy(v.home.target);
+    v.radius = v.home.radius;
+    v.orbitQuat.copy(v.home.quat);
+    applyView(v);
+  }
+
+  // Lock does NOT copy the camera matrix. The two scans can sit at different
+  // world origins (anything loaded with "Keep original alignment" stays where
+  // its file puts it) and can be different sizes, so an absolute copy would
+  // aim the follower's camera at the other scan's location, at the wrong
+  // scale. Instead the follower is driven to the same ORIENTATION, the same
+  // ZOOM FACTOR and the same PAN OFFSET — with zoom and pan measured relative
+  // to each pane's own home framing and rescaled by the ratio between them.
+  // Since the shared orientation gives both cameras the same right/up basis,
+  // scaling the world-space pan delta is equivalent to matching the pan on
+  // screen, so no extra basis change is needed.
+  function syncLockedViews(src){
+    if(!dualActive || !viewB) return;
+    const dst = (src === viewA) ? viewB : viewA;
+    if(!dst || !src.home.radius || !dst.home.radius) return;
+    const k = dst.home.radius / src.home.radius;
+    dst.orbitQuat.copy(src.orbitQuat);
+    dst.radius = src.radius * k;
+    dst.target.copy(src.target).sub(src.home.target).multiplyScalar(k).add(dst.home.target);
+    applyView(dst);
+  }
+
+  function assignPaneModel(paneIndex, modelId){
+    const v = paneView(paneIndex);
+    if(!v) return;
+    v.modelId = modelId;
+    if(paneIndex === 0) dualLeftId = modelId; else dualRightId = modelId;
+    resetPaneView(paneIndex);
+    updateDualChrome();
+  }
+
+  function setDualActivePane(index){
+    if(!dualActive || index === dualActivePane) return;
+    dualActivePane = index;
+    updateDualChrome();
+  }
+
+  function updateDualChrome(){
+    const divider = document.getElementById('dualDivider');
+    const paneL = document.getElementById('dualPaneL');
+    const paneR = document.getElementById('dualPaneR');
+    const disp = dualActive ? 'block' : 'none';
+    divider.style.display = disp;
+    paneL.style.display = disp;
+    paneR.style.display = disp;
+    paneL.classList.toggle('active', dualActive && dualActivePane === 0);
+    paneR.classList.toggle('active', dualActive && dualActivePane === 1);
+    if(!dualActive) return;
+    const nameFor = (v) => {
+      const m = v && models.find(x => x.id === v.modelId);
+      return m ? m.name : '—';
+    };
+    const lockMark = dualLocked ? '🔒 ' : '';
+    document.getElementById('dualLabelL').textContent = lockMark + 'L · ' + nameFor(viewA);
+    document.getElementById('dualLabelR').textContent = lockMark + 'R · ' + nameFor(viewB);
+  }
+
+  function renderDualView(){
+    const w = holder.clientWidth, h = holder.clientHeight;
+    const halfW = Math.floor(w / 2);
+    const savedVis = models.map(m => m.group.visible);
+    renderer.setScissorTest(true);
+    for(let pane = 0; pane < 2; pane++){
+      const v = paneView(pane);
+      if(!v || v.modelId === null) continue;
+      models.forEach((m) => { m.group.visible = (m.id === v.modelId); });
+      updateLightsToCamera(v); // the shared light rig follows whichever camera draws
+      const x = pane === 0 ? 0 : halfW;
+      const paneW = pane === 0 ? halfW : (w - halfW);
+      renderer.setViewport(x, 0, paneW, h);
+      renderer.setScissor(x, 0, paneW, h);
+      renderer.render(scene, v.camera);
+    }
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, w, h);
+    models.forEach((m, i) => { m.group.visible = savedVis[i]; });
+  }
+
+  // Every single-view tool is disabled while dual view is on: they all raycast
+  // through the one global camera with full-canvas NDC against ALL models, and
+  // several of them write shared scene-level state. Making eight of them
+  // pane-aware would dwarf this feature and its regression surface. Nothing
+  // the user has already drawn, marked or computed is destroyed here — it is
+  // only disarmed and hidden, and comes straight back on exit.
+  function suspendSingleViewTools(){
+    setSectionArmed(false);
+    isDrawingSection = false;
+    hideDrawOverlay();
+    setBaseArmed(false);
+    setThreePointArmed(false);
+    setMarginArmed(false);
+    setMeasure3DArmed(false);
+    // Undercut mode sets mesh.visible = false on every model; turning it off
+    // restores that so it can't fight dual view's per-pane visibility swap.
+    if(undercutActive) setUndercutActive(false);
+    if(typeof setMeasureArmed === 'function') setMeasureArmed(false);
+
+    // The .dual-locked class dims the section AND sets pointer-events:none on
+    // its body, so nothing inside can be clicked. Removing the class on exit
+    // restores every control exactly as it was — no per-control state to save.
+    DUAL_LOCKED_SECTION_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if(el) el.classList.add('dual-locked');
+    });
+
+    // Hide every scene-level tool visual: the cut plane, the section outline,
+    // 3-point markers, margin markers/lines/preview, 3D measurement
+    // markers/lines/labels, the undercut gizmo. Walking the scene rather than
+    // enumerating those variables is deliberate — an enumeration would
+    // silently miss anything added later.
+    dualSavedSceneVis = [];
+    const modelGroups = new Set(models.map(m => m.group));
+    scene.children.forEach((obj) => {
+      if(obj.isLight || obj === grid || modelGroups.has(obj)) return;
+      dualSavedSceneVis.push({ obj, visible: obj.visible });
+      obj.visible = false;
+    });
+
+    updateClipping(); // dualActive is already true here, so this clears the clip
+    css2dRenderer.domElement.style.display = 'none';
+    dualCsPanelWasOpen = !document.getElementById('crossSectionPanel').classList.contains('cs-hidden');
+    hideCsPanel();
+  }
+
+  function restoreSingleViewTools(){
+    DUAL_LOCKED_SECTION_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if(el) el.classList.remove('dual-locked');
+    });
+    if(dualSavedSceneVis){
+      dualSavedSceneVis.forEach(({ obj, visible }) => { obj.visible = visible; });
+      dualSavedSceneVis = null;
+    }
+    models.forEach((m) => { m.group.visible = true; });
+    updateClipping(); // dualActive is already false here, so the clip comes back
+    css2dRenderer.domElement.style.display = '';
+    if(dualCsPanelWasOpen) showCsPanel();
+    dualCsPanelWasOpen = false;
+  }
+
+  function setDualView(on){
+    if(on === dualActive) return;
+    if(on && models.length < 2) return;
+    dualActive = on; // set first — updateClipping() and resize() both read it
+
+    document.getElementById('tDualView').classList.toggle('on', on);
+    document.getElementById('dualControls').style.display = on ? 'block' : 'none';
+
+    if(on){
+      ensureViewB();
+      viewB.camera.fov = camera.fov;
+      suspendSingleViewTools();
+
+      const leftSel = document.getElementById('dualLeftSelect');
+      const rightSel = document.getElementById('dualRightSelect');
+      let leftId = Number(leftSel.value);
+      let rightId = Number(rightSel.value);
+      // Deliberately picking the same scan for both panes is allowed (it's a
+      // reasonable way to compare two angles of one scan), so only an invalid
+      // selection is corrected here.
+      if(!models.some(m => m.id === leftId)) leftId = models[0].id;
+      if(!models.some(m => m.id === rightId)){
+        rightId = (models.find(m => m.id !== leftId) || models[0]).id;
+      }
+      leftSel.value = String(leftId);
+      rightSel.value = String(rightId);
+      dualActivePane = 0;
+      assignPaneModel(0, leftId);
+      assignPaneModel(1, rightId);
+      if(dualLocked) syncLockedViews(viewA);
+    } else {
+      restoreSingleViewTools();
+      viewA.modelId = null;
+      if(viewB) viewB.modelId = null;
+      // The last dual frame left the shared light rig aimed at pane B's
+      // camera. Re-derive from viewA so the single view is lit correctly on
+      // its very first frame back, not only after the next camera change.
+      updateCamera();
+    }
+
+    updateDualChrome();
+    invalidateResize(); // the canvas size is unchanged but the camera aspect isn't
+  }
+
+  // Rebuilds the two pane pickers from the current model list and gates the
+  // whole feature on having at least two models loaded. Called from
+  // renderModelList(), which already runs on every load and every removal.
+  function refreshDualSelects(){
+    const sels = [document.getElementById('dualLeftSelect'), document.getElementById('dualRightSelect')];
+    const enough = models.length >= 2;
+    const opts = models.map(m => `<option value="${m.id}">${escapeHtml(m.name)}</option>`).join('');
+    sels.forEach((sel, i) => {
+      const prev = i === 0 ? dualLeftId : dualRightId;
+      sel.innerHTML = opts;
+      const fallback = models[i] ? models[i].id : (models[0] ? models[0].id : null);
+      const want = models.some(m => m.id === prev) ? prev : fallback;
+      if(want !== null) sel.value = String(want);
+      sel.disabled = !enough;
+    });
+    document.getElementById('tDualView').classList.toggle('disabled', !enough);
+    document.getElementById('dualDisabledNote').textContent = enough
+      ? 'Section cut, reorient, margin, measure, undercut and mapping tools are unavailable while dual view is on.'
+      : 'Load at least two models to use dual view.';
+  }
+
+  // Keeps an active dual view honest when models are added or removed.
+  function reconcileDualPanes(){
+    if(!dualActive) return;
+    if(models.length < 2){ setDualView(false); return; }
+    if(!models.some(m => m.id === dualLeftId)){
+      const id = (models.find(m => m.id !== dualRightId) || models[0]).id;
+      assignPaneModel(0, id);
+      document.getElementById('dualLeftSelect').value = String(id);
+    }
+    if(!models.some(m => m.id === dualRightId)){
+      const id = (models.find(m => m.id !== dualLeftId) || models[0]).id;
+      assignPaneModel(1, id);
+      document.getElementById('dualRightSelect').value = String(id);
+    }
+    updateDualChrome();
+  }
+
+  document.getElementById('tDualView').addEventListener('click', (e) => {
+    if(e.currentTarget.classList.contains('disabled')) return;
+    setDualView(!dualActive);
+  });
+
+  document.getElementById('tDualLock').addEventListener('click', () => {
+    dualLocked = !dualLocked;
+    document.getElementById('tDualLock').classList.toggle('on', dualLocked);
+    // Snap the follower onto the pane the user was last driving, rather than
+    // leaving the two mismatched until the next drag.
+    if(dualLocked) syncLockedViews(activeView());
+    updateDualChrome();
+  });
+
+  document.getElementById('btnDualReset').addEventListener('click', () => {
+    if(!dualActive) return;
+    resetPaneView(0);
+    resetPaneView(1);
+  });
+
+  document.getElementById('dualLeftSelect').addEventListener('change', (e) => {
+    const id = Number(e.target.value);
+    dualLeftId = id;
+    if(dualActive){
+      assignPaneModel(0, id);
+      // Sync FROM the untouched pane so the newly-shown scan picks up the
+      // pair's current relative framing.
+      nudgeLockedPartner(viewB);
+    }
+  });
+
+  document.getElementById('dualRightSelect').addEventListener('change', (e) => {
+    const id = Number(e.target.value);
+    dualRightId = id;
+    if(dualActive){
+      assignPaneModel(1, id);
+      nudgeLockedPartner(viewA);
+    }
+  });
+
+  refreshDualSelects();
+
+  // ================= /DUAL VIEW =================
+
   // ---------- UI wiring: file loading ----------
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
@@ -5398,16 +5984,32 @@
       // perspective "look" (how compressed/exaggerated things feel)
       // without it reading as a zoom.
       const oldRad = oldFov * Math.PI / 180, newRad = newFov * Math.PI / 180;
-      const compensated = radius * Math.tan(oldRad / 2) / Math.tan(newRad / 2);
-      radius = Math.max(modelRadius * 0.05, Math.min(modelRadius * 30, compensated));
-      camera.fov = newFov;
-      camera.updateProjectionMatrix();
-      updateCamera();
+      // Applied to every live view (just viewA outside dual view) so both
+      // panes keep matching perspective.
+      allViews().forEach((v) => {
+        const mr = viewModelRadius(v);
+        const compensated = v.radius * Math.tan(oldRad / 2) / Math.tan(newRad / 2);
+        v.radius = Math.max(mr * 0.05, Math.min(mr * 30, compensated));
+        v.camera.fov = newFov;
+        v.camera.updateProjectionMatrix();
+        // The home framing distance is FOV-derived too, so it gets the same
+        // compensation — otherwise a locked pair would jump on the next drag,
+        // since lock works on radius/home.radius ratios.
+        v.home.radius = v.home.radius * Math.tan(oldRad / 2) / Math.tan(newRad / 2);
+        applyView(v);
+      });
     }
     fovValue.textContent = newFov + '°';
   });
 
   document.getElementById('btnReset').addEventListener('click', () => {
+    if(dualActive){
+      // In dual view this resets the active pane only — "Reset both views"
+      // in the Dual View section is the two-pane version.
+      resetPaneView(dualActivePane);
+      nudgeLockedPartner(paneView(dualActivePane));
+      return;
+    }
     frameCameraOnModels();
   });
 
@@ -5446,12 +6048,21 @@
     animateMarginPointHover(now);
     if(autoRotate && !isDraggingPlane){
       const qSpin = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), dt * 0.4);
-      orbitQuat.premultiply(qSpin).normalize();
-      updateCamera();
+      // allViews() is [viewA] outside dual view. Spinning both panes by the
+      // same increment keeps a locked pair locked and an unlocked pair both
+      // animating.
+      allViews().forEach((v) => {
+        v.orbitQuat.premultiply(qSpin).normalize();
+        applyView(v);
+      });
     }
     drawAxisIndicator();
-    renderer.render(scene, camera);
-    css2dRenderer.render(scene, camera);
+    if(dualActive){
+      renderDualView();
+    } else {
+      renderer.render(scene, camera);
+      css2dRenderer.render(scene, camera);
+    }
   }
   requestAnimationFrame(animate);
 })();
