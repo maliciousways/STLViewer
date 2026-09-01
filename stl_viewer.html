@@ -239,10 +239,10 @@
   .model-name{
     font-size: 12.5px;
     color: var(--ink);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+    white-space: normal;
     flex: 1;
+    min-width: 0;
   }
   .model-remove{
     background: transparent;
@@ -4036,7 +4036,7 @@
     listEl.innerHTML = margins.map((m) => `
       <div class="model-row margin-row" data-id="${m.id}">
         <div class="model-row-top">
-          <span class="model-name">Tooth ${escapeHtml(m.toothNumber)} — ${escapeHtml(m.model.name)}</span>
+          <span class="model-name" title="Tooth ${escapeHtml(m.toothNumber)} — ${escapeHtml(m.model.name)}">Tooth ${escapeHtml(m.toothNumber)} — ${escapeHtml(m.model.name)}</span>
           <button class="model-remove" data-id="${m.id}" title="Remove">×</button>
         </div>
         <div class="model-meta">${m.rawPoints.length} points${m.closed ? ' · closed loop' : ''}</div>
