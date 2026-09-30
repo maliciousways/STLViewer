@@ -964,9 +964,9 @@
             <path d="M12 3v12M12 3l-4 4M12 3l4 4"/>
             <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
           </svg>
-          <div>Drop .stl, .obj, or .ply files here<br>or click to browse — add as many as you like</div>
+          <div>Drop .stl, .obj, or .ply files here (with any texture images)<br>or click to browse — add as many as you like</div>
         </div>
-        <input type="file" id="fileInput" accept=".stl,.obj,.ply" multiple>
+        <input type="file" id="fileInput" accept=".stl,.obj,.ply,.jpg,.jpeg,.png" multiple>
         <div class="toggle-row" style="margin-top:10px;">
           <span class="toggle-label-with-info">
             <label for="tPreserveAlignment">Keep original alignment</label>
@@ -1424,7 +1424,7 @@
     modelColorMix = pct;
     const c = computeModelColor();
     models.forEach((m) => {
-      if(m.hasVertexColors) return; // keep the file's own colors untinted
+      if(m.hasVertexColors || m.hasTexture) return; // keep the file's own colors untinted
       m.mesh.material.color.copy(c);
       m.mesh.material.needsUpdate = true;
     });
@@ -2564,11 +2564,15 @@
 
     let format = 'ascii';
     let currentElement = null;
+    let textureFile = null;
     const elements = [];
     for(const line of headerLines){
       const tokens = line.split(/\s+/);
       if(tokens[0] === 'format'){
         format = tokens[1];
+      } else if(tokens[0] === 'comment' && tokens[1] === 'TextureFile' && tokens.length > 2){
+        // De facto convention (iTero, MeshLab): names the image that the texcoords index into.
+        textureFile = line.replace(/^comment\s+TextureFile\s+/, '');
       } else if(tokens[0] === 'element'){
         currentElement = { name: tokens[1], count: parseInt(tokens[2], 10), properties: [] };
         elements.push(currentElement);
@@ -2599,11 +2603,54 @@
     const gType = hasColor ? vertexElement.properties[gIdx].type : null;
     const bType = hasColor ? vertexElement.properties[bIdx].type : null;
 
+    // Texture coordinates come either per face corner (a `texcoord` list of
+    // u0 v0 u1 v1 ...) or per vertex (u/v, s/t, or texture_u/texture_v).
+    const faceIdxProp = faceElement ? findPlyIndexProperty(faceElement) : -1;
+    const faceTexProp = faceElement ? faceElement.properties.findIndex(p => p.list && p.name === 'texcoord') : -1;
+    const findVertexProp = (...names) => vertexElement.properties.findIndex(p => names.includes(p.name));
+    const uIdx = findVertexProp('u', 's', 'texture_u');
+    const vIdx = findVertexProp('v', 't', 'texture_v');
+    const hasVertexUV = uIdx !== -1 && vIdx !== -1;
+    const hasUV = faceTexProp !== -1 || hasVertexUV;
+
     const vertexCount = vertexElement.count;
     const vertices = new Float32Array(vertexCount * 3);
     const vertColors = hasColor ? new Float32Array(vertexCount * 3) : null;
+    const vertUVs = hasVertexUV ? new Float32Array(vertexCount * 2) : null;
     const positions = [];
     const colorsOut = hasColor ? [] : null;
+    const uvsOut = hasUV ? [] : null;
+
+    // Fan-triangulates one face. `tc` is that face's texcoord list, if any.
+    function emitFace(idxs, tc){
+      const hasFaceUV = tc && tc.length >= idxs.length * 2;
+      const inRange = (vi) => vi >= 0 && vi < vertexCount;
+      for(let k = 1; k < idxs.length - 1; k++){
+        // Same guard parseOBJ() applies: one out-of-range index would put an
+        // undefined (→ NaN) into the position buffer, and a single NaN vertex
+        // makes the whole bounding box NaN, wrecking auto-framing and clipping.
+        if(!inRange(idxs[0]) || !inRange(idxs[k]) || !inRange(idxs[k+1])) continue;
+        for(const corner of [0, k, k + 1]){
+          const vi = idxs[corner];
+          positions.push(vertices[vi*3], vertices[vi*3+1], vertices[vi*3+2]);
+          if(hasColor) colorsOut.push(vertColors[vi*3], vertColors[vi*3+1], vertColors[vi*3+2]);
+          if(hasUV){
+            if(hasFaceUV) uvsOut.push(tc[corner*2], tc[corner*2+1]);
+            else if(hasVertexUV) uvsOut.push(vertUVs[vi*2], vertUVs[vi*2+1]);
+            else uvsOut.push(0, 0);
+          }
+        }
+      }
+    }
+    function result(formatLabel){
+      return {
+        positions: new Float32Array(positions),
+        colors: hasColor ? new Float32Array(colorsOut) : null,
+        uvs: hasUV ? new Float32Array(uvsOut) : null,
+        textureFile,
+        format: formatLabel
+      };
+    }
 
     if(format === 'ascii'){
       const dataText = new TextDecoder('utf-8').decode(bytes.subarray(dataStart));
@@ -2642,34 +2689,20 @@
               vertColors[i*3+1] = normalizePlyColor(values[gIdx], gType);
               vertColors[i*3+2] = normalizePlyColor(values[bIdx], bType);
             }
+            if(hasVertexUV){ vertUVs[i*2] = values[uIdx]; vertUVs[i*2+1] = values[vIdx]; }
           }
         } else if(element === faceElement){
-          const indexPropIdx = findPlyIndexProperty(element);
           for(let i = 0; i < element.count; i++){
-            const idxs = readRecord(element.properties)[indexPropIdx];
+            const values = readRecord(element.properties);
+            const idxs = values[faceIdxProp];
             if(!idxs) continue;
-            for(let k = 1; k < idxs.length - 1; k++){
-              const a = idxs[0], b = idxs[k], c = idxs[k+1];
-              if(a < 0 || b < 0 || c < 0 || a >= vertexCount || b >= vertexCount || c >= vertexCount) continue;
-              positions.push(vertices[a*3], vertices[a*3+1], vertices[a*3+2]);
-              positions.push(vertices[b*3], vertices[b*3+1], vertices[b*3+2]);
-              positions.push(vertices[c*3], vertices[c*3+1], vertices[c*3+2]);
-              if(hasColor){
-                colorsOut.push(vertColors[a*3], vertColors[a*3+1], vertColors[a*3+2]);
-                colorsOut.push(vertColors[b*3], vertColors[b*3+1], vertColors[b*3+2]);
-                colorsOut.push(vertColors[c*3], vertColors[c*3+1], vertColors[c*3+2]);
-              }
-            }
+            emitFace(idxs, faceTexProp !== -1 ? values[faceTexProp] : null);
           }
         } else {
           for(let i = 0; i < element.count; i++) nextLine();
         }
       }
-      return {
-        positions: new Float32Array(positions),
-        colors: hasColor ? new Float32Array(colorsOut) : null,
-        format: 'PLY (ASCII)'
-      };
+      return result('PLY (ASCII)');
     } else {
       const littleEndian = format === 'binary_little_endian';
       const dv = new DataView(buffer, dataStart);
@@ -2707,7 +2740,7 @@
       for(const element of elements){
         if(element === vertexElement){
           for(let i = 0; i < vertexCount; i++){
-            let x = 0, y = 0, z = 0, r = 0, g = 0, b = 0;
+            let x = 0, y = 0, z = 0, r = 0, g = 0, b = 0, u = 0, v2 = 0;
             for(let pIdx = 0; pIdx < element.properties.length; pIdx++){
               const v = readProperty(element.properties[pIdx]);
               if(pIdx === xIdx) x = v;
@@ -2716,34 +2749,23 @@
               else if(hasColor && pIdx === rIdx) r = normalizePlyColor(v, rType);
               else if(hasColor && pIdx === gIdx) g = normalizePlyColor(v, gType);
               else if(hasColor && pIdx === bIdx) b = normalizePlyColor(v, bType);
+              else if(hasVertexUV && pIdx === uIdx) u = v;
+              else if(hasVertexUV && pIdx === vIdx) v2 = v;
             }
             vertices[i*3] = x; vertices[i*3+1] = y; vertices[i*3+2] = z;
             if(hasColor){ vertColors[i*3] = r; vertColors[i*3+1] = g; vertColors[i*3+2] = b; }
+            if(hasVertexUV){ vertUVs[i*2] = u; vertUVs[i*2+1] = v2; }
           }
         } else if(element === faceElement){
-          const indexPropIdx = findPlyIndexProperty(element);
           for(let i = 0; i < element.count; i++){
-            let idxs = null;
+            let idxs = null, tc = null;
             for(let pIdx = 0; pIdx < element.properties.length; pIdx++){
               const v = readProperty(element.properties[pIdx]);
-              if(pIdx === indexPropIdx) idxs = v;
+              if(pIdx === faceIdxProp) idxs = v;
+              else if(pIdx === faceTexProp) tc = v;
             }
             if(!idxs) continue;
-            for(let k = 1; k < idxs.length - 1; k++){
-              const a = idxs[0], b2 = idxs[k], c = idxs[k+1];
-              // Same guard parseOBJ() applies: one out-of-range index would put an
-              // undefined (→ NaN) into the position buffer, and a single NaN vertex
-              // makes the whole bounding box NaN, wrecking auto-framing and clipping.
-              if(a < 0 || b2 < 0 || c < 0 || a >= vertexCount || b2 >= vertexCount || c >= vertexCount) continue;
-              positions.push(vertices[a*3], vertices[a*3+1], vertices[a*3+2]);
-              positions.push(vertices[b2*3], vertices[b2*3+1], vertices[b2*3+2]);
-              positions.push(vertices[c*3], vertices[c*3+1], vertices[c*3+2]);
-              if(hasColor){
-                colorsOut.push(vertColors[a*3], vertColors[a*3+1], vertColors[a*3+2]);
-                colorsOut.push(vertColors[b2*3], vertColors[b2*3+1], vertColors[b2*3+2]);
-                colorsOut.push(vertColors[c*3], vertColors[c*3+1], vertColors[c*3+2]);
-              }
-            }
+            emitFace(idxs, tc);
           }
         } else {
           for(let i = 0; i < element.count; i++){
@@ -2751,11 +2773,7 @@
           }
         }
       }
-      return {
-        positions: new Float32Array(positions),
-        colors: hasColor ? new Float32Array(colorsOut) : null,
-        format: 'PLY (Binary)'
-      };
+      return result('PLY (Binary)');
     }
   }
 
@@ -2898,7 +2916,21 @@
   }
 
   // ---------- Build a model from parsed geometry, added to the collection ----------
-  function loadModelData(buffer, fileName, forcePreserve){
+  // Loads a user-supplied image as a texture via an object URL, so it works
+  // from file:// with no server. The mesh shows untextured until it arrives.
+  function loadTextureFromFile(file){
+    const url = URL.createObjectURL(file);
+    return new THREE.TextureLoader().load(
+      url,
+      () => URL.revokeObjectURL(url),
+      undefined,
+      () => { URL.revokeObjectURL(url); console.warn('Could not load texture "' + file.name + '".'); }
+    );
+  }
+
+  // `images` maps lower-cased file names to image Files dropped in the same
+  // batch, so a PLY's `comment TextureFile` can find its companion image.
+  function loadModelData(buffer, fileName, forcePreserve, images){
     // forcePreserve lets a batch upload (see handleFiles) decide this
     // per-file before the async FileReader resolves, rather than reading
     // the global toggle at an unpredictable later moment. A single-file
@@ -2923,6 +2955,17 @@
     if(hasVertexColors){
       geometry.setAttribute('color', new THREE.BufferAttribute(parsed.colors, 3));
     }
+    let texture = null;
+    if(parsed.uvs && parsed.textureFile){
+      const imageFile = images && images.get(parsed.textureFile.toLowerCase());
+      if(imageFile){
+        geometry.setAttribute('uv', new THREE.BufferAttribute(parsed.uvs, 2));
+        texture = loadTextureFromFile(imageFile);
+      } else {
+        console.warn('"' + fileName + '" uses texture "' + parsed.textureFile + '", but that image was not loaded with it.');
+      }
+    }
+    const hasTexture = !!texture;
     geometry.computeVertexNormals();
     geometry.computeBoundingBox();
 
@@ -2962,8 +3005,9 @@
       // With vertex colors, Three.js multiplies them by this base color —
       // white leaves the file's own colors showing through accurately,
       // instead of being tinted by the gray/beige slider.
-      color: hasVertexColors ? 0xffffff : computeModelColor(),
+      color: (hasVertexColors || hasTexture) ? 0xffffff : computeModelColor(),
       vertexColors: hasVertexColors,
+      map: texture,
       specular: initialFinish.specular,
       shininess: initialFinish.shininess,
       flatShading: true,
@@ -2998,6 +3042,7 @@
       opacity: 100,
       lastOpacity: 100,
       hasVertexColors,
+      hasTexture,
       preserveAlignment: preserveThisModel,
       // Cumulative transform applied to the geometry since it was parsed
       // (centering, auto-orient, any later reorientation) — inverted later
@@ -3112,6 +3157,7 @@
     if(thkResult && thkResult.modelId === id) disposeThicknessResult();
 
     scene.remove(m.group);
+    if(m.mesh.material.map) m.mesh.material.map.dispose();
     m.mesh.geometry.dispose(); m.mesh.material.dispose();
     m.wireMesh.geometry.dispose(); m.wireMesh.material.dispose();
     models.splice(idx, 1);
@@ -3224,7 +3270,7 @@
           <span class="model-name" title="${escapeHtml(m.name)}">${escapeHtml(m.name)}</span>
           <button class="model-remove" data-id="${m.id}" title="Remove">×</button>
         </div>
-        <div class="model-meta">${m.format} · ${m.triCount.toLocaleString()} tris · ${m.size.x.toFixed(1)}×${m.size.z.toFixed(1)}×${m.size.y.toFixed(1)}${m.hasVertexColors ? ' · <span class="model-vcolor-tag">●&nbsp;vertex colors</span>' : ''}</div>
+        <div class="model-meta">${m.format} · ${m.triCount.toLocaleString()} tris · ${m.size.x.toFixed(1)}×${m.size.z.toFixed(1)}×${m.size.y.toFixed(1)}${m.hasVertexColors ? ' · <span class="model-vcolor-tag">●&nbsp;vertex colors</span>' : ''}${m.hasTexture ? ' · <span class="model-vcolor-tag">●&nbsp;texture</span>' : ''}</div>
         <div class="model-opacity-row">
           <span class="model-opacity-label model-opacity-toggle" data-id="${m.id}" title="Toggle opacity">Opacity</span>
           <input type="range" class="model-opacity-slider" data-id="${m.id}" min="0" max="100" value="${m.opacity}">
@@ -5906,8 +5952,15 @@
     handleFiles(e.dataTransfer.files);
   });
 
+  const IMAGE_FILE_RE = /\.(jpe?g|png)$/i;
+
   function handleFiles(fileList){
-    const files = Array.from(fileList || []);
+    const all = Array.from(fileList || []);
+    // Images are not models — they are companion textures that a model in the
+    // same batch can reference by name (e.g. a PLY's `comment TextureFile`).
+    const images = new Map();
+    all.filter(f => IMAGE_FILE_RE.test(f.name)).forEach(f => images.set(f.name.toLowerCase(), f));
+    const files = all.filter(f => !IMAGE_FILE_RE.test(f.name));
     // Uploading more than one file in a single action is a strong signal
     // they're a related set that should stay positioned relative to each
     // other (matched jaw scans, a scan plus its temp restoration, etc.) —
@@ -5915,12 +5968,12 @@
     // if the toggle wasn't explicitly turned on. A single file at a time
     // still gets the normal auto-centered, auto-oriented treatment.
     const batchPreserve = preserveAlignment || files.length > 1;
-    files.forEach((file) => handleFile(file, batchPreserve));
+    files.forEach((file) => handleFile(file, batchPreserve, images));
   }
 
-  function handleFile(file, forcePreserve){
+  function handleFile(file, forcePreserve, images){
     const reader = new FileReader();
-    reader.onload = (e) => loadModelData(e.target.result, file.name, forcePreserve);
+    reader.onload = (e) => loadModelData(e.target.result, file.name, forcePreserve, images);
     reader.onerror = () => alert('Could not read "' + file.name + '".');
     reader.readAsArrayBuffer(file);
   }
